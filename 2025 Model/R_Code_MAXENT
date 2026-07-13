@@ -1,0 +1,461 @@
+################################################################################
+#                                                                              #
+#                    MAXENT ECOLOGICAL NICHE MODELING                          #
+#                         Benthic Biotope Mapping                              #
+#                                                                              #
+################################################################################
+
+# Author: Tanya Riley
+# Institution: UHI Shetland
+# Date: July 2026
+# Version: 1.0.0
+# License: GPL v3
+
+# PURPOSE: Ecological Niche Modeling using MaxEnt with validation metrics
+# This script loads species occurrence data, environmental layers, runs MaxEnt models,
+# and outputs predictions with validation statistics (TSS, Kappa, AUC, Boyce Index)
+
+# Citation:
+#   If you use this code, please cite:
+#   Riley, T.G., Gillanders, S. & Shucksmith, R. (2026). Shetland Islands Dominant Marine Biotope Map (2025 update). UHI Shetland report. p25. 
+#   GitHub: https://github.co/ShetlandScientist/SI-DomMarBioMap
+
+
+######################################################
+# CONFIGURATION - EDIT THESE SETTINGS
+######################################################
+# Lines to review before running:
+# Line 39-44  : File Paths
+# Line 47-51  : Model Configuration
+# Line 106    : Land shapefile filename
+# Line 127    : Species CSV filename (MAIN INPUT - change for different species)
+# Line 251    : Environmental variable selection
+# Line 376-86 : MaxEnt model settings
+######################################################
+
+# ----------------------------------------------------
+# Model Configuration
+# ----------------------------------------------------
+CONFIG <- list(
+  # Project directory (CHANGE THIS to your local path)
+  base_dir = "C:/Users/YourUsername/Projects/SDM",
+  
+  # Species CSV filename (located in data/species/ folder)
+  species_csv = "your_species.csv",
+  
+  # Model parameters
+  n_replicates = 10,        # Number of bootstrap replicates (recommend 10+) - if changing then review line 332
+  n_background = 10000,     # Number of background points
+  train_test_split = 0.75,  # Proportion for training (0.75 = 75/25 split) - review line 360
+  max_iterations = 5000,    # MaxEnt convergence iterations
+  beta_multiplier = 1,      # Regularization parameter (1=default)
+  
+  # Java memory allocation (increase for large datasets)
+  java_memory = "8g"
+)
+
+# ----------------------------------------------------
+# Load packages
+# ----------------------------------------------------
+library(terra)
+library(sf)
+library(ecospat)
+library(predicts)
+library(pROC)
+library(dismo)
+options(java.parameters = paste0("-Xmx", CONFIG$java_memory))
+library(rJava)
+
+cat("\n========================================\n")
+cat("ECOLOGICAL NICHE MODELING - MaxEnt\n")
+cat("========================================\n\n")
+
+# ----------------------------------------------------
+# Directory Structure (standardized for GitHub)
+# ----------------------------------------------------
+dir_structure <- list(
+  data = file.path(CONFIG$base_dir, "data"),
+  data_species = file.path(CONFIG$base_dir, "data", "species"),
+  data_env = file.path(CONFIG$base_dir, "data", "environmental"),
+  data_spatial = file.path(CONFIG$base_dir, "data", "spatial"),
+  output = file.path(CONFIG$base_dir, "output")
+)
+
+# Create directories if they don't exist
+for(dir in dir_structure) {
+  if(!dir.exists(dir)) {
+    dir.create(dir, recursive = TRUE)
+  }
+}
+
+setwd(dir_structure$output)
+
+
+######################################################
+###############       Part 1       ###################
+###############    PREPARE DATA    ###################
+######################################################
+
+cat("========== STEP 1: LOADING DATA ==========\n\n")
+
+# ----------------------------------------------------
+# Get Study Area Data (LINE 110: REVIEW)
+# ----------------------------------------------------
+
+# Load land shapefile
+land_shapefile_name <- "vmdvec_dissolved_Land_WGS84.shp"
+shetland_shp_path <- file.path(dir_structure$data_spatial, land_shapefile_name)
+
+if(!file.exists(shetland_shp_path)) {
+  stop("Land shapefile not found. Expected at: ", shetland_shp_path,
+       "\nPlace shapefile in data/spatial/ folder")
+}
+
+shetland_land <- st_read(shetland_shp_path, quiet = TRUE)
+cat("✓ Loaded study area shapefile:", land_shapefile_name, "\n")
+cat("  CRS:", st_crs(shetland_land)$input, "\n\n")
+
+# Plot land outline
+plot(st_geometry(shetland_land), col = "lightgrey", border = "darkgrey", 
+     main = "Study Area - Land Outline")
+
+# ----------------------------------------------------
+# Prep Species Data (LINE 131: REVIEW - CHANGE THIS FOR DIFFERENT SPECIES)
+# ----------------------------------------------------
+
+# **CHANGE THIS LINE FOR DIFFERENT SPECIES**
+species_csv_filename <- CONFIG$species_csv
+
+# Build full path
+species_csv_path <- file.path(dir_structure$data_species, species_csv_filename)
+
+# File existence check
+if(!file.exists(species_csv_path)) {
+  stop("Species data file not found. Check filename at line 105: ", species_csv_path,
+       "\nExpected location: data/species/")
+}
+
+# Extract species name for outputs
+species_filename <- tools::file_path_sans_ext(basename(species_csv_path))
+cat("Processing species:", species_filename, "\n")
+
+# Create species-specific output directory
+species_output_dir <- file.path(dir_structure$output, species_filename)
+if(!dir.exists(species_output_dir)) {
+  dir.create(species_output_dir, recursive = TRUE)
+  cat("✓ Created output directory:", species_filename, "\n")
+} else {
+  cat("✓ Using existing output directory:", species_filename, "\n")
+}
+
+out_dir <- species_output_dir
+
+# Load species data from CSV
+species_df <- read.csv(species_csv_path)
+
+cat("\nSpecies data summary:\n")
+cat("  Total records:", nrow(species_df), "\n")
+cat("  Columns:", paste(colnames(species_df), collapse=", "), "\n")
+
+# Ensure coordinates are numeric
+species_df$LATITUDE  <- as.numeric(as.character(species_df$LATITUDE))
+species_df$LONGITUDE <- as.numeric(as.character(species_df$LONGITUDE))
+
+# Remove rows with missing coordinates
+n_before <- nrow(species_df)
+species_df <- species_df[!is.na(species_df$LATITUDE) & !is.na(species_df$LONGITUDE), ]
+n_removed_coords <- n_before - nrow(species_df)
+if(n_removed_coords > 0) {
+  cat("  Removed", n_removed_coords, "records with missing coordinates\n")
+}
+
+# Create modeling dataframe
+species_sl.df <- data.frame(
+  species = species_df$Biotope,
+  x = species_df$LONGITUDE,
+  y = species_df$LATITUDE
+)
+
+# Remove duplicates
+n_before <- nrow(species_sl.df)
+species_sl.df <- species_sl.df[!duplicated(species_sl.df[, c("x", "y")]), ]
+n_removed_dups <- n_before - nrow(species_sl.df)
+if(n_removed_dups > 0) {
+  cat("  Removed", n_removed_dups, "duplicate coordinates\n")
+}
+
+cat("  Final occurrence points:", nrow(species_sl.df), "\n\n")
+
+# Warning for small datasets
+if(nrow(species_sl.df) < 20) {
+  warning("Small dataset detected (n=", nrow(species_sl.df), 
+          "). Recommend n>=30. Consider collecting more data.")
+}
+
+# ----------------------------------------------------
+# Plot Species on Land
+# ----------------------------------------------------
+
+cat("Creating occurrence map...\n")
+
+# Convert to sf object
+species_sf <- st_as_sf(species_sl.df, 
+                       coords = c("x", "y"), 
+                       crs = st_crs(shetland_land))
+
+# Save map
+png(file.path(out_dir, paste0(species_filename, "_occurrence_map.png")),
+    width = 1000, height = 1000, res = 150)
+plot(st_geometry(shetland_land), 
+     col = "lightgrey", 
+     border = "darkgrey", 
+     main = paste("Species Occurrences -", species_filename),
+     cex.main = 1.3)
+plot(st_geometry(species_sf), 
+     pch = 19, 
+     col = "red", 
+     cex = 1.2, 
+     add = TRUE)
+legend("topright", 
+       legend = c("Land", paste0("Occurrences (n=", nrow(species_sl.df), ")")),
+       col = c("lightgrey", "red"), 
+       pch = c(15, 19), 
+       cex = 0.9, 
+       bg = "white")
+dev.off()
+cat("✓ Occurrence map saved\n\n")
+
+# ----------------------------------------------------
+# Prep Environmental Data (LINE 255: REVIEW)
+# ----------------------------------------------------
+
+cat("========== STEP 2: ENVIRONMENTAL LAYERS ==========\n\n")
+
+setwd(dir_structure$data_env)
+
+# List all .tif files
+tif_files <- list.files(pattern = "\\.tif$", full.names = TRUE)
+
+if(length(tif_files) == 0) {
+  stop("No .tif files found in: ", dir_structure$data_env,
+       "\nPlace environmental rasters in data/environmental/ folder")
+}
+
+cat("Loading", length(tif_files), "environmental layers...\n")
+rasters <- rast(tif_files)
+
+# Select variables for modeling (LINE 228: REVIEW)
+# Variables based on correlation analysis (|r| < 0.7):
+# 1=aspect, 5=bot_light, 10=bot_salinity, 12=bot_temp, 13=bot_velocity, 
+# 14=curve, 15=depth, 18=sed, 19=slope, 21=surf_temp_am, 22=tide
+egv <- rasters[[c(1, 5, 10, 12, 13, 14, 15, 18, 19, 21, 22)]]
+
+cat("Selected", nlyr(egv), "variables:\n")
+for(i in 1:nlyr(egv)) {
+  cat("  ", i, ". ", names(egv)[i], "\n", sep="")
+}
+
+# Validate layers
+na_check <- global(egv, "min", na.rm=TRUE)
+if(any(is.na(na_check[,1]))) {
+  warning("Some layers contain only NA values:")
+  print(na_check[is.na(na_check[,1]), , drop=FALSE])
+}
+
+# Plot environmental layers
+plot(egv, main = names(egv))
+
+# ----------------------------------------------------
+# Extract environmental values at species locations
+# ----------------------------------------------------
+
+cat("\nExtracting environmental values at occurrence locations...\n")
+sp.df <- terra::extract(egv,
+                        as.matrix(species_sl.df[, c("x", "y")]),
+                        method = "simple")
+
+cat("✓ Extracted values for", nrow(sp.df), "points\n")
+
+# **CRITICAL: Remove points with NA environmental values**
+cat("\nChecking for NA values in environmental data...\n")
+na_count <- rowSums(is.na(sp.df))
+cat("  Points with NA values:", sum(na_count > 0), "\n")
+
+if(sum(na_count > 0) > 0) {
+  cat("  Removing", sum(na_count > 0), "points with NA environmental values\n")
+  
+  valid_rows <- complete.cases(sp.df)
+  species_sl.df <- species_sl.df[valid_rows, ]
+  sp.df <- sp.df[valid_rows, ]
+  
+  cat("  Remaining occurrence points:", nrow(species_sl.df), "\n\n")
+  
+  if(nrow(species_sl.df) < 3) {
+    stop("Too few valid occurrence points (n=", nrow(species_sl.df), 
+         "). Need at least 3 points. Points may be outside environmental data extent or on land.")
+  }
+  
+  if(nrow(species_sl.df) < 10) {
+    warning("VERY SMALL DATASET (n=", nrow(species_sl.df), 
+            "). Results will be HIGHLY UNRELIABLE. Strongly recommend collecting more data.")
+  }
+} else {
+  cat("  All points have complete environmental data\n\n")
+}
+
+
+#####################################################
+###############      Part 2       ###################
+############### MAXENT WITH DISMO ###################
+#####################################################
+
+cat("========== STEP 3: MAXENT MODELING ==========\n\n")
+
+######################################################
+# PREPARING BACKGROUND DATA
+
+# ----------------------------------------------------
+# Generate background points (LINE 48: REVIEW)
+# ----------------------------------------------------
+
+data.sp <- species_sl.df[, c("x","y")]
+
+cat("Generating background points...\n")
+abs <- predicts::backgroundSample(egv,
+                                  n = CONFIG$n_background,  # LINE 48
+                                  p = data.sp,
+                                  excludep = TRUE)
+
+cat("✓ Generated", nrow(abs), "background points\n\n")
+
+######################################################
+# MAXENT - WITH REPLICATES (LINE 47: REVIEW)
+
+n_replicates <- CONFIG$n_replicates  # LINE 47
+
+cat("Running MaxEnt with", n_replicates, "replicates...\n")
+if(n_replicates < 5) {
+  warning("Only ", n_replicates, " replicates. Recommend n>=10 for publication.")
+}
+
+# Initialize storage
+models <- vector("list", n_replicates)
+train_list <- vector("list", n_replicates)
+test_list  <- vector("list", n_replicates)
+
+eval_results <- data.frame(
+  replicate = 1:n_replicates,
+  TSS = NA_real_,
+  Kappa = NA_real_,
+  Boyce = NA_real_,
+  AUC = NA_real_
+)
+
+pb <- txtProgressBar(min = 0, max = n_replicates, style = 3)
+
+### MAIN MAXENT MODEL ###
+
+for (i in 1:n_replicates) {
+  
+  ## ---- Train/test split (LINE 49: REVIEW) ----
+  indexes <- sample(seq_len(nrow(data.sp)), 
+                    size = floor(CONFIG$train_test_split * nrow(data.sp)))
+  
+  data.train <- data.sp[-indexes, ]
+  data.test  <- data.sp[indexes, ]
+  
+  train_list[[i]] <- data.train
+  test_list[[i]]  <- data.test
+  
+  ## ---- Run MaxEnt (LINE 376-86: REVIEW settings) ----
+  mx_model <- predicts::MaxEnt(
+    x = egv,
+    p = data.train,
+    a = abs,
+    args = c(
+      "randomseed",
+      "writeclampgrid",
+      paste0("betamultiplier=", CONFIG$beta_multiplier),     # LINE 347
+      paste0("maximumiterations=", CONFIG$max_iterations),   # LINE 348
+      "responsecurves",
+      "jackknife",
+      "pictures",
+      paste0("replicates=", i),
+      "replicatetype=bootstrap"
+    ),
+    removeDuplicates = TRUE
+  )
+  
+  # **SAVE MODEL TO LIST**
+  models[[i]] <- mx_model
+  
+  setTxtProgressBar(pb, i)
+}
+
+close(pb)
+cat("\n✓ All models completed\n\n")
+
+# ----------------------------------------------------
+# Create Ensemble Prediction
+# ----------------------------------------------------
+
+cat("Creating ensemble prediction...\n")
+
+all_predictions <- list()
+pb_pred <- txtProgressBar(min = 0, max = n_replicates, style = 3)
+
+for(i in 1:n_replicates) {
+  pred_i <- predict(models[[i]], egv, args = "outputformat=cloglog")
+  all_predictions[[i]] <- pred_i
+  setTxtProgressBar(pb_pred, i)
+}
+
+close(pb_pred)
+
+pred_stack <- rast(all_predictions)
+p.mx <- mean(pred_stack, na.rm = TRUE)
+
+cat("\n✓ Ensemble prediction created\n")
+cat("  Min:  ", sprintf("%.4f", global(p.mx, "min", na.rm=TRUE)[1,1]), "\n")
+cat("  Max:  ", sprintf("%.4f", global(p.mx, "max", na.rm=TRUE)[1,1]), "\n")
+cat("  Mean: ", sprintf("%.4f", global(p.mx, "mean", na.rm=TRUE)[1,1]), "\n\n")
+
+plot(p.mx, main = paste("Mean Prediction -", species_filename))
+
+
+######################################################
+###############      OUTPUTS       ###################
+######################################################
+
+cat("========== STEP 4: EXPORTING OUTPUTS ==========\n\n")
+
+# ----------------------------------------------------
+# Variable Importance
+# ----------------------------------------------------
+
+var_importance <- models[[n_replicates]]@results[
+  grep("contribution", rownames(models[[n_replicates]]@results)), ]
+write.csv(var_importance, 
+          file.path(out_dir, paste0(species_filename, "_variable_importance.csv")),
+          row.names = TRUE)
+cat("✓ Variable importance saved\n")
+
+# ----------------------------------------------------
+# Response curves note
+# ----------------------------------------------------
+
+cat("\nNote: MaxEnt auto-generated response curves\n")
+cat("  Look for 'plots_species_*.png' in MaxEnt output directory\n")
+cat("  Or view in MaxEnt HTML results file\n\n")
+
+# ----------------------------------------------------
+# Export Rasters
+# ----------------------------------------------------
+
+# TIF (recommended format)
+tif_file <- file.path(out_dir, paste0(species_filename, "_prediction.tif"))
+terra::writeRaster(p.mx, filename = tif_file, overwrite = TRUE)
+cat("✓ TIF raster saved:", basename(tif_file), "\n")
+
+# ASC (legacy format)
+asc_file <- file.path(out_dir, paste)
